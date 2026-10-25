@@ -1,0 +1,119 @@
+# Fork-only workflow. Once a day it checks k1tbyte/Wand-Enhancer's master branch.
+# When upstream has a commit this fork has not released yet, it merges that commit
+# into this fork (in the runner only, nothing is pushed), builds the unsigned
+# WandEnhancer.exe and publishes it as a release here. Watch this repo with
+# Custom -> Releases to get an email for each new build. If the merge conflicts
+# or the build fails, the run fails and nothing is published.
+name: Fork sync and release
+
+on:
+  schedule:
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild and replace the release even if this upstream commit exists"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-sync-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: k1tbyte/Wand-Enhancer
+  UPSTREAM_BRANCH: master
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      upstream_sha: ${{ steps.ver.outputs.upstream_sha }}
+      tag: ${{ steps.ver.outputs.tag }}
+      build: ${{ steps.ver.outputs.build }}
+    steps:
+      - name: compare upstream head with fork releases
+        id: ver
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          sha=$(gh api "repos/$UPSTREAM_REPO/commits/$UPSTREAM_BRANCH" --jq .sha)
+          tag="build-${sha:0:12}"
+          echo "upstream head: $sha"
+          echo "upstream_sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            if [ "$FORCE" = "true" ]; then
+              gh release delete "$tag" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag
+              echo "build=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "$tag already released, nothing to do"
+              echo "build=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-windows:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: merge upstream into the fork
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git remote add upstream "https://github.com/$UPSTREAM_REPO.git"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          git merge --no-edit "${{ needs.check.outputs.upstream_sha }}"
+
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 10.17.0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web-panel/pnpm-lock.yaml
+
+      - name: build unsigned executable
+        shell: pwsh
+        run: ./build.ps1 -Configuration Release
+
+      - name: publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check.outputs.tag }}
+          UPSTREAM_SHA: ${{ needs.check.outputs.upstream_sha }}
+        run: |
+          $version = [regex]::Match((Get-Content WandEnhancer/Properties/AssemblyInfo.cs -Raw), '(?m)^\[assembly: AssemblyVersion\("([^"]+)"\)').Groups[1].Value
+          $notes = try { ./scripts/get-changelog-section.ps1 -Version $version } catch { "No changelog entry for $version yet." }
+          $body = @(
+            "Unsigned WandEnhancer.exe built from upstream $env:UPSTREAM_REPO@$($env:UPSTREAM_SHA.Substring(0, 12)).",
+            "Upstream commit: https://github.com/$env:UPSTREAM_REPO/commit/$env:UPSTREAM_SHA",
+            "",
+            "## Changelog $version",
+            "",
+            $notes
+          ) -join "`n"
+          Set-Content release-notes.md $body -Encoding utf8
+          gh release create $env:TAG WandEnhancer/bin/Release/WandEnhancer.exe `
+            -R $env:GITHUB_REPOSITORY `
+            --title "Wand Enhancer $version (upstream $($env:UPSTREAM_SHA.Substring(0, 7)))" `
+            --notes-file release-notes.md `
+            --latest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
